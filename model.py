@@ -11,10 +11,7 @@ from itertools import combinations
 from collections import defaultdict
 import os
 
-# === Настройка (опционально) ===
-# os.environ["HF_HOME"] = "D:/hf_cache"
 
-# === Вспомогательные функции ===
 def get_track_id(relative_path):
     return relative_path.split("/")[1]
 
@@ -50,7 +47,6 @@ def build_pairs(split_data, max_pairs=None):
     
     return all_pairs
 
-# === PyTorch Dataset с фиксированной длиной аудио ===
 class MelodySimDataset(TorchDataset):
     def __init__(self, original_split, max_pairs=None, sample_rate=44100, duration=5.0):
         self.original_split = original_split
@@ -65,14 +61,10 @@ class MelodySimDataset(TorchDataset):
         i1, i2, label = self.pairs[idx]
         item1 = self.original_split[i1]
         item2 = self.original_split[i2]
-
-        # Загрузка waveform
         waveform1 = torch.tensor(item1["audio"]["array"], dtype=torch.float32)
         waveform2 = torch.tensor(item2["audio"]["array"], dtype=torch.float32)
-
-        # Приведение к моно
         if waveform1.ndim > 1:
-            waveform1 = waveform1.mean(dim=0, keepdim=True)  # [channels, time] -> [1, time]
+            waveform1 = waveform1.mean(dim=0, keepdim=True)
         else:
             waveform1 = waveform1.unsqueeze(0)
 
@@ -81,7 +73,6 @@ class MelodySimDataset(TorchDataset):
         else:
             waveform2 = waveform2.unsqueeze(0)
 
-        # Паддинг или обрезка до фиксированной длины
         def pad_or_trim(waveform, target_len):
             if waveform.shape[1] > target_len:
                 return waveform[:, :target_len]
@@ -95,7 +86,7 @@ class MelodySimDataset(TorchDataset):
 
         return waveform1, waveform2, torch.tensor(label, dtype=torch.float32)
 
-# === Модель (обновлён n_fft) ===
+
 class LinearPerformerAttention(nn.Module):
     def __init__(self, dim, heads=8, feature_dim=256, dropout=0.1, causal=False):
         super().__init__()
@@ -252,7 +243,7 @@ class LinearPerformerAttentionMusic(nn.Module):
         x = x + self.dropout(self.mlp(x))
         x = self.norm(x)
         return x
-        
+
 
 class AudioToEmbedding(nn.Module):
     def __init__(self,
@@ -276,40 +267,30 @@ class AudioToEmbedding(nn.Module):
         self.embedding_dim = embedding_dim
 
     def forward(self, waveforms: torch.Tensor):
-        # === Нормализация входа до [B, T] ===
         original_shape = waveforms.shape
         if waveforms.dim() == 1:
-            # Случай: одиночный аудиофрагмент без батча
-            waveforms = waveforms.unsqueeze(0)  # [T] -> [1, T]
+            waveforms = waveforms.unsqueeze(0)
         elif waveforms.dim() == 3:
-            # Случай: [B, C, T] — многоканальный
             if waveforms.shape[1] == 1:
-                waveforms = waveforms.squeeze(1)  # [B, 1, T] -> [B, T]
+                waveforms = waveforms.squeeze(1)
             else:
-                waveforms = waveforms.mean(dim=1)  # [B, C, T] -> [B, T]
+                waveforms = waveforms.mean(dim=1)
         elif waveforms.dim() == 2:
-            # Уже [B, T] — всё хорошо
             pass
         else:
             raise ValueError(f"Unsupported waveform tensor shape: {original_shape}")
 
         batch_size = waveforms.size(0)
         device = waveforms.device
-
-        # Получаем мел-спектрограмму: [B, n_mels, time]
         mels = self.melspec(waveforms)
         mels = torch.log(mels + 1e-9)
+        mels = mels.transpose(1, 2)
 
-        # Приводим к [B, time, n_mels] — всегда 3D
-        mels = mels.transpose(1, 2)  # [B, T, F]
-
-        # Паддинг или обрезка до seq_len
         current_len = mels.size(1)
         if current_len > self.seq_len:
             mels = mels[:, :self.seq_len, :]
         else:
             pad_len = self.seq_len - current_len
-            # Создаём паддинг той же размерности: [B, pad_len, F]
             padding = torch.zeros(
                 batch_size, pad_len, mels.size(2),
                 device=device,
@@ -317,10 +298,9 @@ class AudioToEmbedding(nn.Module):
             )
             mels = torch.cat([mels, padding], dim=1)
 
-        # Проекция и позиционные эмбеддинги
-        x = self.proj(mels)  # [B, seq_len, embedding_dim]
-        positions = torch.arange(0, self.seq_len, device=device).unsqueeze(0)  # [1, seq_len]
-        pos_embeddings = self.pos_emb(positions)  # [1, seq_len, embedding_dim]
+        x = self.proj(mels)
+        positions = torch.arange(0, self.seq_len, device=device).unsqueeze(0)
+        pos_embeddings = self.pos_emb(positions)
         x = x + pos_embeddings
         return x
 
@@ -377,7 +357,7 @@ class BaseModel(nn.Module):
         out = self.out(out)
         return out
 
-# === Обучение ===
+
 def train(model, train_loader, num_epochs=10, lr=1e-4, device="cuda", save_path="best_model.pth"):
     print("Training model...")
     model = model.to(device)
@@ -425,17 +405,14 @@ def validate(model, val_loader, device="cuda", save_path="best_model.pth"):
     print(f"📊 Final Validation Loss: {val_loss:.4f}")
     return val_loss
 
-# === Запуск ===
+
 if __name__ == "__main__":
-    # Загрузка датасета
     original_dataset = load_dataset("amaai-lab/MelodySim")
 
-    # Параметры
-    MAX_PAIRS = 30000  # Уменьшено для быстрого старта (можно увеличить)
+    MAX_PAIRS = 30000
     SAMPLE_RATE = 44100
-    DURATION = 5.0  # секунд
+    DURATION = 5.0
 
-    # Создание датасетов
     train_dataset = MelodySimDataset(
         original_dataset["train"],
         max_pairs=MAX_PAIRS,
@@ -452,11 +429,9 @@ if __name__ == "__main__":
     print(f"Train pairs: {len(train_dataset)}")
     print(f"Val pairs: {len(val_dataset)}")
 
-    # DataLoader (num_workers=0 для Windows)
     train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=2, num_workers=0)
 
-    # Модель
     model = BaseModel(
         sample_rate=SAMPLE_RATE,
         seq_len=512,
@@ -468,10 +443,8 @@ if __name__ == "__main__":
         layers=8
     )
 
-    # Устройство
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Обучение
     train(model, train_loader, num_epochs=10, lr=1e-4, device=device, save_path="best_model.pth")
     validate(model, val_loader, device=device, save_path="best_model.pth")
